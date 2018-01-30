@@ -25,6 +25,7 @@ import (
 	"go.chromium.org/luci/common/clock"
 	"go.chromium.org/luci/common/errors"
 
+	"github.com/bradfitz/gomemcache/memcache"
 	"golang.org/x/net/context"
 )
 
@@ -195,6 +196,19 @@ func (m *memcacheImpl) NewItem(key string) mc.Item {
 	return &mcItem{key: key}
 }
 
+// https://github.com/bradfitz/gomemcache/blob/1952afaa557dc08e8e0d89eafab110fb501c1a2b/memcache/memcache.go#L90-L100
+func legalKey(key string) bool {
+	if len(key) > 250 {
+		return false
+	}
+	for i := 0; i < len(key); i++ {
+		if key[i] <= ' ' || key[i] == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
 func doCBs(items []mc.Item, cb mc.RawCB, inner func(mc.Item) error) {
 	// This weird construction is so that we:
 	//   - don't take the lock for the entire multi operation, since it could imply
@@ -204,6 +218,10 @@ func doCBs(items []mc.Item, cb mc.RawCB, inner func(mc.Item) error) {
 	//     implementation (like a recursive deadlock)
 	errs := make([]error, len(items))
 	for i, itm := range items {
+		if !legalKey(itm.Key()) {
+			errs[i] = memcache.ErrMalformedKey
+			continue
+		}
 		errs[i] = inner(itm)
 	}
 	for _, e := range errs {
@@ -268,6 +286,9 @@ func (m *memcacheImpl) GetMulti(keys []string, cb mc.RawItemCB) error {
 
 	for i, k := range keys {
 		itms[i], errs[i] = func() (mc.Item, error) {
+			if !legalKey(k) {
+				return nil, memcache.ErrMalformedKey
+			}
 			m.data.lock.Lock()
 			defer m.data.lock.Unlock()
 			val, err := m.data.retrieveLocked(now, k)
@@ -292,6 +313,9 @@ func (m *memcacheImpl) DeleteMulti(keys []string, cb mc.RawCB) error {
 
 	for i, k := range keys {
 		errs[i] = func() error {
+			if !legalKey(k) {
+				return memcache.ErrMalformedKey
+			}
 			m.data.lock.Lock()
 			defer m.data.lock.Unlock()
 			_, err := m.data.retrieveLocked(now, k)
@@ -320,6 +344,10 @@ func (m *memcacheImpl) Flush() error {
 
 func (m *memcacheImpl) Increment(key string, delta int64, initialValue *uint64) (uint64, error) {
 	now := clock.Now(m.ctx)
+
+	if !legalKey(key) {
+		return 0, memcache.ErrMalformedKey
+	}
 
 	m.data.lock.Lock()
 	defer m.data.lock.Unlock()
